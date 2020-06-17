@@ -11,3 +11,9 @@ services:
     image: mongo-express
     ports:
       - 8081:8081
+
+  mailhog:
+    image: mailhog/mailhog
+    ports:
+      - 1025:1025
+      - 8025:8025

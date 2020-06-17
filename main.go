@@ -9,9 +9,12 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
+	"github.com/emersion/go-sasl"
+	"github.com/emersion/go-smtp"
 	"github.com/gorilla/mux"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -19,7 +22,6 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 	"golang.org/x/crypto/bcrypt"
-	"gopkg.in/gomail.v2"
 )
 
 type User struct {
@@ -46,36 +48,55 @@ type Profile struct {
 
 var client *mongo.Client
 
+func getEnv(key string, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+
+	}
+	return fallback
+}
+
+var MONGO_URL string
+var LISTEN_PORT int
+var SMTP_SERVER string
+var SMTP_PORT string
+var SMTP_USER string
+var SMTP_PASS string
+
 func writeResponse(response http.ResponseWriter, header int, msg string) {
 	response.WriteHeader(header)
 	response.Write([]byte(`{ "message": "` + msg + `" }`))
 }
 
-func GenerateVerificationToken() string {
+func generateVerificationToken() string {
 	b := make([]byte, 8)
 	rand.Read(b)
 	return fmt.Sprintf("%x", b)
 }
 
-func SendVerificationEmail(user *User) error {
-	m := gomail.NewMessage()
-	m.SetHeader("From", os.Getenv("SMTP_USER"))
-	m.SetHeader("To", user.Email)
-	m.SetHeader("Subject", "Verify your email address")
-	m.SetBody("text/plain", "http://127.0.0.1:8000/verify/"+user.Token)
+// TODO Only supports plain authentication at the moment, we should support other types
+// TODO Subject line should settable through an environment variable
+// TODO Message should be settable through an environment variable
+func sendVerificationEmail(user *User) error {
+	// Set up authentication information.
+	auth := sasl.NewPlainClient("", SMTP_USER, SMTP_PASS)
 
-	port, _ := strconv.Atoi(os.Getenv("SMTP_PORT"))
-	d := gomail.NewDialer(os.Getenv("SMTP_HOST"), port, os.Getenv("SMTP_USER"), os.Getenv("SMTP_PASS"))
-
-	// Send the email
-	if err := d.DialAndSend(m); err != nil {
+	// Connect to the server, authenticate, set the sender and recipient,
+	// and send the email all in one step.
+	to := []string{user.Email}
+	msg := strings.NewReader("To: " + user.Email + "\r\n" +
+		"Subject: Verify your email address\r\n" +
+		"\r\n" +
+		"http://127.0.0.1:8000/verify/" + user.Token + "\r\n")
+	err := smtp.SendMail(SMTP_SERVER+":"+SMTP_PORT, auth, "test", to, msg)
+	if err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func Authenticate(header http.Header, profile *Profile) error {
+func authenticate(header http.Header, profile *Profile) error {
 	tokenString := header.Get("Authorization")
 
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
@@ -163,7 +184,7 @@ func GetRegisterEndpoint(response http.ResponseWriter, request *http.Request) {
 	user.Password = string(hash)
 
 	// Generate a verification token
-	user.Token = GenerateVerificationToken()
+	user.Token = generateVerificationToken()
 
 	// TODO And the expiration date is 24 hours from now
 	user.TokenExpirationDateTime = primitive.NewDateTimeFromTime(time.Now().AddDate(0, 0, 1))
@@ -176,9 +197,9 @@ func GetRegisterEndpoint(response http.ResponseWriter, request *http.Request) {
 	}
 
 	// TODO Send a verification email to the user
-	err = SendVerificationEmail(&user)
+	err = sendVerificationEmail(&user)
 	if err != nil {
-		writeResponse(response, http.StatusInternalServerError, "Error while sending verification email, try again"+err.Error())
+		writeResponse(response, http.StatusInternalServerError, "Error while sending verification email, try again "+err.Error())
 		return
 	}
 
@@ -260,7 +281,7 @@ func GetProfileEndpoint(response http.ResponseWriter, request *http.Request) {
 	response.Header().Set("content-type", "application/json")
 
 	var profile Profile
-	err := Authenticate(request.Header, &profile)
+	err := authenticate(request.Header, &profile)
 	if err != nil {
 		writeResponse(response, http.StatusUnauthorized, err.Error())
 		return
@@ -281,7 +302,7 @@ func CreateMealEndpoint(response http.ResponseWriter, request *http.Request) {
 	response.Header().Set("content-type", "application/json")
 
 	var profile Profile
-	err := Authenticate(request.Header, &profile)
+	err := authenticate(request.Header, &profile)
 	if err != nil {
 		writeResponse(response, http.StatusUnauthorized, err.Error())
 		return
@@ -354,20 +375,43 @@ func GetMealEndpoint(response http.ResponseWriter, request *http.Request) {
 }
 
 func main() {
+	var err error
+	var ok bool
+	MONGO_URL = getEnv("MONGO_URL", "http://127.0.0.1:27017")
+
+	LISTEN_PORT, err = strconv.Atoi(getEnv("LISTEN_PORT", "8000"))
+	if err != nil {
+		log.Fatal("LISTEN_PORT environment variable is invalid, expected a port number")
+	}
+
+	if SMTP_SERVER, ok = os.LookupEnv("SMTP_SERVER"); !ok {
+		log.Fatal("SMTP_SERVER environment variable not set")
+	}
+
+	if SMTP_PORT, ok = os.LookupEnv("SMTP_PORT"); !ok {
+		log.Fatal("SMTP_PORT environment variable not set")
+	}
+
+	if SMTP_USER, ok = os.LookupEnv("SMTP_USER"); !ok {
+		log.Fatal("SMTP_USER environment variable not set")
+	}
+
+	if SMTP_PASS, ok = os.LookupEnv("SMTP_PASS"); !ok {
+		log.Fatal("SMTP_PASS environment variable not set")
+	}
+
 	ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
 
-	const MONGODB_URI = "mongodb://127.0.0.1:27017"
-
-	clientOptions := options.Client().ApplyURI(MONGODB_URI)
+	clientOptions := options.Client().ApplyURI(MONGO_URL)
 	client, _ = mongo.Connect(ctx, clientOptions)
 
 	// Ensure that we are successfully connected to the database
-	err := client.Ping(ctx, readpref.Primary())
+	err = client.Ping(ctx, readpref.Primary())
 	if err != nil {
 		log.Fatal("Failed to connect to MongoDB:", err)
 	}
 	defer client.Disconnect(ctx)
-	fmt.Println("👌 Successfuly connected to MongoDB at:", MONGODB_URI)
+	fmt.Println("👌 Successfuly connected to MongoDB at:", MONGO_URL)
 
 	router := mux.NewRouter()
 	router.HandleFunc("/register", GetRegisterEndpoint).Methods("POST")
