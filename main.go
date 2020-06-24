@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +14,8 @@ import (
 	"github.com/emersion/go-sasl"
 	"github.com/emersion/go-smtp"
 	"github.com/gorilla/mux"
+	"github.com/rs/cors"
+	"github.com/spf13/viper"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -48,21 +48,6 @@ type Profile struct {
 
 var client *mongo.Client
 
-func getEnv(key string, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		return value
-
-	}
-	return fallback
-}
-
-var MONGO_URL string
-var LISTEN_PORT int
-var SMTP_SERVER string
-var SMTP_PORT string
-var SMTP_USER string
-var SMTP_PASS string
-
 func writeResponse(response http.ResponseWriter, header int, msg string) {
 	response.WriteHeader(header)
 	response.Write([]byte(`{ "message": "` + msg + `" }`))
@@ -79,7 +64,7 @@ func generateVerificationToken() string {
 // TODO Message should be settable through an environment variable
 func sendVerificationEmail(user *User) error {
 	// Set up authentication information.
-	auth := sasl.NewPlainClient("", SMTP_USER, SMTP_PASS)
+	auth := sasl.NewPlainClient("", viper.GetString("SmtpUser"), viper.GetString("SmtpPass"))
 
 	// Connect to the server, authenticate, set the sender and recipient,
 	// and send the email all in one step.
@@ -87,8 +72,8 @@ func sendVerificationEmail(user *User) error {
 	msg := strings.NewReader("To: " + user.Email + "\r\n" +
 		"Subject: Verify your email address\r\n" +
 		"\r\n" +
-		"http://127.0.0.1:8000/verify/" + user.Token + "\r\n")
-	err := smtp.SendMail(SMTP_SERVER+":"+SMTP_PORT, auth, "test", to, msg)
+		"http://localhost:" + viper.GetString("ListenPort") + "/verify/" + user.Token + "\r\n")
+	err := smtp.SendMail(viper.GetString("SmtpServer")+":"+viper.GetString("SmtpPort"), auth, viper.GetString("SmtpFrom"), to, msg)
 	if err != nil {
 		return err
 	}
@@ -104,7 +89,7 @@ func authenticate(header http.Header, profile *Profile) error {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
 		}
-		return []byte(os.Getenv("SECRET")), nil
+		return []byte(viper.GetString("Secret")), nil
 	})
 
 	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
@@ -267,7 +252,7 @@ func GetLoginEndpoint(response http.ResponseWriter, request *http.Request) {
 		"username": existing.Username,
 	})
 
-	tokenString, err := token.SignedString([]byte(os.Getenv("SECRET")))
+	tokenString, err := token.SignedString([]byte(viper.GetString("Secret")))
 
 	if err != nil {
 		writeResponse(response, http.StatusInternalServerError, "Error while generating token, try again"+err.Error())
@@ -375,34 +360,54 @@ func GetMealEndpoint(response http.ResponseWriter, request *http.Request) {
 }
 
 func main() {
+	viper.SetDefault("ListenPort", 8000)
+
+	// Set default for using local MongoDB with default port
+	viper.SetDefault("MongoUrl", "mongodb://localhost")
+	viper.SetDefault("MongoPort", 27017)
+
+	// Set defaults for MailHog
+	viper.SetDefault("SmtpServer", "localhost")
+	viper.SetDefault("SmtpPort", 25)
+	viper.SetDefault("SmtpFrom", "")
+	viper.SetDefault("SmtpUser", "")
+	viper.SetDefault("SmtpPass", "")
+
+	// Set debug mode by default
+	viper.SetDefault("Debug", true)
+
+	// Set a default secret for testing
+	// This should overriden in production
+	viper.SetDefault("Secret", "Secret")
+
+	// name of config file (without extension)
+	viper.SetConfigName("config.yaml")
+
+	// Look for the config file in the working directory
+	viper.AddConfigPath(".")
+
 	var err error
-	var ok bool
-	MONGO_URL = getEnv("MONGO_URL", "http://127.0.0.1:27017")
 
-	LISTEN_PORT, err = strconv.Atoi(getEnv("LISTEN_PORT", "8000"))
-	if err != nil {
-		log.Fatal("LISTEN_PORT environment variable is invalid, expected a port number")
+	// Find and read the config file
+	if err = viper.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			log.Print("Could not find config file, using defaults.")
+		} else {
+			log.Fatal("Error reading config file:", err)
+		}
 	}
 
-	if SMTP_SERVER, ok = os.LookupEnv("SMTP_SERVER"); !ok {
-		log.Fatal("SMTP_SERVER environment variable not set")
-	}
+	// Also try read the secret from environment variable `FOODIE_SECRET`
+	viper.SetEnvPrefix("foodie")
+	viper.BindEnv("secret")
 
-	if SMTP_PORT, ok = os.LookupEnv("SMTP_PORT"); !ok {
-		log.Fatal("SMTP_PORT environment variable not set")
-	}
-
-	if SMTP_USER, ok = os.LookupEnv("SMTP_USER"); !ok {
-		log.Fatal("SMTP_USER environment variable not set")
-	}
-
-	if SMTP_PASS, ok = os.LookupEnv("SMTP_PASS"); !ok {
-		log.Fatal("SMTP_PASS environment variable not set")
+	if viper.GetBool("Debug") {
+		log.Print("❗ Running in debug mode, not recommended for production")
 	}
 
 	ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
 
-	clientOptions := options.Client().ApplyURI(MONGO_URL)
+	clientOptions := options.Client().ApplyURI(viper.GetString("MongoUrl"))
 	client, _ = mongo.Connect(ctx, clientOptions)
 
 	// Ensure that we are successfully connected to the database
@@ -411,7 +416,7 @@ func main() {
 		log.Fatal("Failed to connect to MongoDB:", err)
 	}
 	defer client.Disconnect(ctx)
-	fmt.Println("👌 Successfuly connected to MongoDB at:", MONGO_URL)
+	log.Print("👌 Successfuly connected to MongoDB at: ", viper.GetString("MongoUrl"))
 
 	router := mux.NewRouter()
 	router.HandleFunc("/register", GetRegisterEndpoint).Methods("POST")
@@ -422,6 +427,11 @@ func main() {
 	router.HandleFunc("/meals", GetMealListEndpoint).Methods("GET")
 	router.HandleFunc("/meals/{id}", GetMealEndpoint).Methods("GET")
 
-	fmt.Println("🚀 Listening at: http://127.0.0.1:8000")
-	log.Fatal(http.ListenAndServe(":8000", router))
+	handler := cors.New(cors.Options{
+		AllowedHeaders: []string{"Authorization", "Content-Type"},
+		Debug:          viper.GetBool("Debug"),
+	}).Handler(router)
+
+	log.Print("🚀 Listening at: http://localhost:" + viper.GetString("ListenPort"))
+	log.Fatal(http.ListenAndServe(":"+viper.GetString("ListenPort"), handler))
 }
